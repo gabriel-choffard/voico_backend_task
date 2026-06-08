@@ -52,6 +52,7 @@ class Call(SQLModel, table=True):
         sa_column=Column(DateTime, nullable=False),
     )
     raw_transcript: Optional[str] = Field(default=None)
+    notes: Optional[str] = Field(default=None)
 
 
 # --- Request / Response schemas ---
@@ -63,6 +64,17 @@ class WebhookCallPayload(SQLModel):
     duration_seconds: Optional[int] = None
     raw_transcript: Optional[str] = None
     ended_at: Optional[datetime] = None
+
+
+class NotesUpdatePayload(SQLModel):
+    """Request body for ``PATCH /api/calls/{id}/notes``.
+
+    ``notes`` is required (the key must be present) but may be ``null`` to clear
+    the field. Keeping it required — rather than defaulting to ``None`` — avoids
+    silently wiping notes when an empty or malformed body is sent.
+    """
+
+    notes: Optional[str]
 
 
 class CallResponse(SQLModel):
@@ -78,6 +90,7 @@ class CallResponse(SQLModel):
     created_at: datetime
     updated_at: datetime
     raw_transcript: Optional[str]
+    notes: Optional[str]
 
 
 class CallCounts(SQLModel):
