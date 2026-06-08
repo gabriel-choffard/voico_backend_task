@@ -21,6 +21,28 @@ class CallLabel(str, Enum):
     other = "Other"
 
 
+class CallSortField(str, Enum):
+    """Columns that ``GET /api/calls`` is allowed to sort by.
+
+    Constraining sorting to an enum (rather than an arbitrary string) keeps the
+    repository's ``getattr(Call, ...)`` safe — only these known columns can ever
+    be ordered on.
+    """
+
+    phone_number = "phone_number"
+    caller_name = "caller_name"
+    duration_seconds = "duration_seconds"
+    status = "status"
+    label = "label"
+    started_at = "started_at"
+    created_at = "created_at"
+
+
+class SortOrder(str, Enum):
+    asc = "asc"
+    desc = "desc"
+
+
 class Call(SQLModel, table=True):
     __tablename__ = "calls"
 
@@ -56,6 +78,24 @@ class Call(SQLModel, table=True):
 
 
 # --- Request / Response schemas ---
+
+
+class CallFilters(SQLModel):
+    """Combinable, all-optional filters + sort for ``GET /api/calls``.
+
+    Every field is independent and ANDed together by the repository. ``status``
+    is included here (driven by the status tabs) alongside the Task 2 filters so
+    a single object carries the full query intent.
+    """
+
+    status: Optional[CallStatus] = None
+    caller_name: Optional[str] = None  # partial, case-insensitive match
+    phone_number: Optional[str] = None  # partial, case-insensitive match
+    label: Optional[CallLabel] = None  # exact match
+    min_duration: Optional[int] = None  # duration_seconds >= min_duration
+    max_duration: Optional[int] = None  # duration_seconds <= max_duration
+    sort_by: CallSortField = CallSortField.created_at
+    sort_order: SortOrder = SortOrder.desc
 
 
 class WebhookCallPayload(SQLModel):

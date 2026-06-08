@@ -8,8 +8,8 @@ from fastapi import HTTPException, status
 from app.modules.calls.repository import CallRepository
 from app.modules.calls.schema import (
     CallCounts,
+    CallFilters,
     CallResponse,
-    CallStatus,
     PaginatedCallsResponse,
 )
 
@@ -22,12 +22,24 @@ class CallService:
 
     async def list_calls(
         self,
-        status: Optional[CallStatus],
+        filters: CallFilters,
         page: int,
         page_size: int,
     ) -> PaginatedCallsResponse:
+        if (
+            filters.min_duration is not None
+            and filters.max_duration is not None
+            and filters.min_duration > filters.max_duration
+        ):
+            # 422 (Unprocessable) — same status FastAPI uses for query validation.
+            # Literal int avoids the deprecated starlette `status.HTTP_422_*` alias.
+            raise HTTPException(
+                status_code=422,
+                detail="min_duration cannot be greater than max_duration",
+            )
+
         calls, total, total_pages, counts = await self.repository.list_calls(
-            status, page, page_size
+            filters, page, page_size
         )
         return PaginatedCallsResponse(
             data=[CallResponse.model_validate(c, from_attributes=True) for c in calls],

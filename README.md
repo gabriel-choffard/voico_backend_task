@@ -52,7 +52,7 @@ Interactive docs: `http://localhost:8000/docs`
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/calls` | List calls (filterable by status, paginated) |
+| `GET` | `/api/calls` | List calls — multi-filter, search & column sorting, paginated — ✅ extended (Task 2) |
 | `GET` | `/api/calls/{id}` | Get single call |
 | `PATCH` | `/api/calls/{id}/notes` | Update notes on a call — ✅ implemented (Task 1) |
 | `POST` | `/api/webhook/call` | Update an existing call (status, duration, transcript, end time) — to be implemented in Task 4 |
@@ -144,6 +144,34 @@ There are four features to implement. Some tasks require adding new endpoints an
 On the **backend**, extend `GET /api/calls` to accept additional query parameters: partial match on caller name and phone number, exact match on label, min/max duration in seconds, and column sorting. All filters should be optional and combinable — multiple active filters are ANDed together.
 
 On the **frontend**, add a filter UI that lets users add and remove filters. Each active filter should be visible as a removable chip or tag. Column headers should be clickable to sort ascending/descending (one active sort at a time). All active filters and sort state should be reflected in the API request in real time.
+
+#### ✅ Solution
+
+**Backend**
+
+- **Filter/sort schemas** ([`schema.py`](backend/app/modules/calls/schema.py)) — added two enums, `CallSortField` (the whitelist of sortable columns) and `SortOrder` (`asc`/`desc`), plus a `CallFilters` model that bundles every optional filter + the sort into one object. Constraining sorting to an enum keeps the repository's `getattr(Call, …)` safe — only known columns can ever be ordered on.
+- **Endpoint** ([`router.py`](backend/app/modules/calls/router.py)) — `GET /api/calls` now declares each new parameter as an explicit, documented `Query(...)`: `caller_name` & `phone_number` (partial), `label` (exact, enum-validated), `min_duration` / `max_duration` (`ge=0`), `sort_by` (enum), `sort_order` (enum). Declaring them individually (rather than as an opaque model) gives clean Swagger docs and free validation — invalid enums or negative durations are rejected with **422** before any DB work. The handler assembles a `CallFilters` and passes it to the service. Defaults (`sort_by=created_at`, `sort_order=desc`, no filters) reproduce the **original behaviour**, so the change is backward-compatible.
+- **Service** ([`service.py`](backend/app/modules/calls/service.py)) — validates the one cross-field rule that `Query` can't (`min_duration ≤ max_duration`, else **422**) before delegating.
+- **Repository** ([`repository.py`](backend/app/modules/calls/repository.py)) — a single `_apply_filters` helper **ANDs** together whichever filters are set, reused across the page query, the total-count query, and the per-status counts:
+  - Partial matches use case-insensitive `ILIKE` with **LIKE-wildcard escaping** (`_escape_like`), so a literal `%` or `_` in the search box is matched literally instead of acting as a wildcard.
+  - Sorting maps the enum to its column with `asc()`/`desc()`, plus a secondary `Call.id` tiebreaker so pagination stays **deterministic** when the sort column has ties.
+  - The per-status **counts** were collapsed into one `GROUP BY` query and now honour every active filter **except** status — so the status tabs/stat-cards reflect the current search, and selecting "Success" doesn't zero out the other tabs.
+
+**Frontend**
+
+- **Types & API** ([`types/calls.ts`](frontend/src/types/calls.ts), [`services/api.ts`](frontend/src/services/api.ts)) — added `CallSortField`, `SortOrder`, `SortState`, `CallFilterValues`, a `CALL_LABELS` constant (mirrors the backend enum), and the new params on `CallsQueryParams`. `api.ts` needed **no change** — it already forwards the whole params object and axios drops `undefined`, so only *active* filters hit the wire.
+- **Filter bar** ([`CallsFilterBar.tsx`](frontend/src/modules/calls/CallsFilterBar.tsx), new) — an **Add filter** dropdown that only lists fields not already active; each active filter renders as a **removable chip** (× to remove, click to re-edit); a **Clear all** resets everything. Editing happens in an inline editor that updates the chip live, with numeric inputs constrained to digits and the label field rendered as a `<select>`. A document click-away closes the menu/editor and `Enter`/`Esc` close it. Fields render off a stable order/key so the editor never remounts (and loses focus) when a freshly-typed value flips a field from inactive→active. Inputs/selects carry `aria-label`s.
+- **Sortable headers** ([`CallsTable.tsx`](frontend/src/modules/calls/CallsTable.tsx)) — column headers are now buttons that **cycle asc → desc → off** (one active sort at a time), showing up/down/neutral chevrons; the `<th>` exposes `aria-sort`.
+- **Wiring** ([`CallsPage.tsx`](frontend/src/modules/calls/CallsPage.tsx)) — holds `filters` and `sort` state; both are part of the TanStack Query **key**, so any change reflects in the request **in real time**. Changing a filter, sort, or tab resets to page 1; the existing status tabs continue to drive the `status` filter (so status isn't duplicated in the filter bar). Three touches keep it production-grade:
+  - **Debounced search** ([`useDebouncedValue.ts`](frontend/src/hooks/useDebouncedValue.ts)) — the filter values feed the query through a 250 ms debounce, so typing fires *one* request after a pause instead of one per keystroke, while the chips/inputs stay instant.
+  - **No spinner flash** — `placeholderData: keepPreviousData` keeps the current rows on screen (with the header's "Syncing…" indicator) while the next page/filter loads, instead of blanking the table on every change.
+  - **Friendly range validation** — when `min_duration > max_duration` the query is skipped (`enabled`) and an inline hint is shown, so an impossible range never surfaces the generic "failed to load" error (the backend still enforces the same rule with a 422).
+
+**Verification**
+
+- Exercised the endpoint both directly (service/repository against the bundled `db.sqlite3`) and over **HTTP** (in-process ASGI): partial caller/phone matches (case-insensitive — `ava` == `AVA`), exact label, duration ranges, asc/desc sorting on **every** sortable column, combined **ANDed** filters, stable non-overlapping pagination under a tied sort, well-formed empty results, counts that stay independent of the status tab, and LIKE-wildcard escaping (a literal `%` matches 0 rows, not all 100).
+- Confirmed every validation path returns **422**: unknown `label`, negative `min_duration`, unknown `sort_by`, and `min_duration > max_duration` (with a clear message).
+- Backend `ruff check` / `ruff format` clean and `mypy` clean on the changed files; frontend `tsc -b` and `vite build` both pass.
 
 ---
 
