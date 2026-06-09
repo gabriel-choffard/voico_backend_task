@@ -1,11 +1,13 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { RefreshCw, Phone } from "lucide-react";
+import { useQuery, keepPreviousData } from "@tanstack/react-query";
+import { RefreshCw, Phone, AlertCircle } from "lucide-react";
 import { callsApi } from "@/services/api";
-import type { Call, CallStatus } from "@/types/calls";
+import type { Call, CallStatus, CallFilterValues, CallSortField, SortState } from "@/types/calls";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { CallsTable } from "./CallsTable";
+import { CallsFilterBar } from "./CallsFilterBar";
 import { CallDetailDrawer } from "./CallDetailDrawer";
 
 type TabValue = "all" | CallStatus;
@@ -21,25 +23,65 @@ const PAGE_SIZE = 20;
 
 export function CallsPage() {
   const [activeTab, setActiveTab] = useState<TabValue>("all");
+  const [filters, setFilters] = useState<CallFilterValues>({});
+  const [sort, setSort] = useState<SortState | null>(null);
   const [page, setPage] = useState(1);
   const [selectedCall, setSelectedCall] = useState<Call | null>(null);
 
   const statusFilter = activeTab === "all" ? undefined : activeTab;
 
+  // Debounce the filter values so typing in a search box fires one request after
+  // the user pauses, not one per keystroke. The chips/inputs still update live.
+  const debouncedFilters = useDebouncedValue(filters, 250);
+
+  // Guard the one rule the server can't infer from a single field. We catch it
+  // client-side too so an impossible range shows a friendly hint instead of the
+  // generic "failed to load" error (the backend still rejects it with a 422).
+  const durationRangeInvalid =
+    filters.min_duration !== undefined &&
+    filters.max_duration !== undefined &&
+    filters.min_duration > filters.max_duration;
+
   const { data, isLoading, isError, refetch, isFetching } = useQuery({
-    queryKey: ["calls", statusFilter, page, PAGE_SIZE],
+    queryKey: ["calls", statusFilter, debouncedFilters, sort, page, PAGE_SIZE],
     queryFn: () =>
       callsApi.list({
         status: statusFilter,
+        caller_name: debouncedFilters.caller_name,
+        phone_number: debouncedFilters.phone_number,
+        label: debouncedFilters.label,
+        min_duration: debouncedFilters.min_duration,
+        max_duration: debouncedFilters.max_duration,
+        sort_by: sort?.field,
+        sort_order: sort?.order,
         page,
         page_size: PAGE_SIZE,
       }),
+    enabled: !durationRangeInvalid,
+    // Keep the current rows on screen while the next page/filter loads instead of
+    // flashing a spinner on every change.
+    placeholderData: keepPreviousData,
     refetchInterval: 5000,
   });
 
   function handleTabChange(tab: TabValue) {
     setActiveTab(tab);
     setPage(1);
+  }
+
+  function handleFiltersChange(next: CallFilterValues) {
+    setFilters(next);
+    setPage(1);
+  }
+
+  // Clickable headers cycle one column at a time: asc → desc → off (default sort).
+  function handleSortChange(field: CallSortField) {
+    setPage(1);
+    setSort((prev) => {
+      if (!prev || prev.field !== field) return { field, order: "asc" };
+      if (prev.order === "asc") return { field, order: "desc" };
+      return null;
+    });
   }
 
   return (
@@ -101,23 +143,32 @@ export function CallsPage() {
         )}
 
         <Card className="bg-white">
-          <div className="flex items-center px-6 pt-5 pb-4 border-b border-border">
-            <div className="flex gap-1 bg-muted rounded-lg p-1 w-fit">
-              {TABS.map((tab) => (
-                <button
-                  key={tab.value}
-                  onClick={() => handleTabChange(tab.value)}
-                  className="px-3 py-1.5 rounded-md text-sm font-medium transition-all"
-                  style={
-                    activeTab === tab.value
-                      ? { backgroundColor: "#FDDF5C", color: "#4a3800", boxShadow: "0 1px 3px rgba(0,0,0,0.10)" }
-                      : { color: "var(--muted-foreground)" }
-                  }
-                >
-                  {tab.label}
-                </button>
-              ))}
+          <div className="px-6 pt-5 pb-4 border-b border-border space-y-4">
+            <div className="flex items-center">
+              <div className="flex gap-1 bg-muted rounded-lg p-1 w-fit">
+                {TABS.map((tab) => (
+                  <button
+                    key={tab.value}
+                    onClick={() => handleTabChange(tab.value)}
+                    className="px-3 py-1.5 rounded-md text-sm font-medium transition-all"
+                    style={
+                      activeTab === tab.value
+                        ? { backgroundColor: "#FDDF5C", color: "#4a3800", boxShadow: "0 1px 3px rgba(0,0,0,0.10)" }
+                        : { color: "var(--muted-foreground)" }
+                    }
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
             </div>
+            <CallsFilterBar filters={filters} onChange={handleFiltersChange} />
+            {durationRangeInvalid && (
+              <p className="flex items-center gap-1.5 text-xs text-red-500">
+                <AlertCircle className="h-3.5 w-3.5" />
+                Min duration must be less than or equal to max duration.
+              </p>
+            )}
           </div>
 
           <CardContent className="p-0">
@@ -142,6 +193,8 @@ export function CallsPage() {
               <CallsTable
                 calls={data?.data ?? []}
                 onRowClick={setSelectedCall}
+                sort={sort}
+                onSortChange={handleSortChange}
               />
             )}
           </CardContent>
@@ -178,7 +231,11 @@ export function CallsPage() {
         </Card>
       </main>
 
-      <CallDetailDrawer call={selectedCall} onClose={() => setSelectedCall(null)} />
+      <CallDetailDrawer
+        call={selectedCall}
+        onClose={() => setSelectedCall(null)}
+        onUpdated={setSelectedCall}
+      />
     </div>
   );
 }

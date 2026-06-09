@@ -1,7 +1,16 @@
 import { format } from "date-fns";
-import { Loader2, CheckCircle2, XCircle, Phone, ChevronRight } from "lucide-react";
+import {
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  Phone,
+  ChevronRight,
+  ChevronUp,
+  ChevronDown,
+  ChevronsUpDown,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import type { Call, CallStatus } from "@/types/calls";
+import type { Call, CallStatus, CallSortField, SortState } from "@/types/calls";
 
 interface StatusBadgeProps {
   status: CallStatus;
@@ -39,12 +48,62 @@ function formatDuration(seconds: number | null): string {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
+/** Display columns mapped to the backend sort field they order by. */
+const SORTABLE_COLUMNS: { label: string; field: CallSortField }[] = [
+  { label: "Phone", field: "phone_number" },
+  { label: "Caller", field: "caller_name" },
+  { label: "Status", field: "status" },
+  { label: "Label", field: "label" },
+  { label: "Duration", field: "duration_seconds" },
+  { label: "Started At", field: "started_at" },
+];
+
+function SortableHeader({
+  label,
+  field,
+  sort,
+  onSort,
+}: {
+  label: string;
+  field: CallSortField;
+  sort: SortState | null;
+  onSort: (field: CallSortField) => void;
+}) {
+  const direction = sort?.field === field ? sort.order : null;
+  return (
+    <th
+      className="py-3 px-4 text-left"
+      aria-sort={direction === "asc" ? "ascending" : direction === "desc" ? "descending" : "none"}
+    >
+      <button
+        type="button"
+        onClick={() => onSort(field)}
+        title={`Sort by ${label}`}
+        className={`group inline-flex items-center gap-1 text-xs font-medium transition-colors ${
+          direction ? "text-foreground" : "text-muted-foreground hover:text-foreground"
+        }`}
+      >
+        {label}
+        {direction === "asc" ? (
+          <ChevronUp className="h-3.5 w-3.5" />
+        ) : direction === "desc" ? (
+          <ChevronDown className="h-3.5 w-3.5" />
+        ) : (
+          <ChevronsUpDown className="h-3.5 w-3.5 opacity-0 transition-opacity group-hover:opacity-50" />
+        )}
+      </button>
+    </th>
+  );
+}
+
 interface CallsTableProps {
   calls: Call[];
   onRowClick: (call: Call) => void;
+  sort: SortState | null;
+  onSortChange: (field: CallSortField) => void;
 }
 
-export function CallsTable({ calls, onRowClick }: CallsTableProps) {
+export function CallsTable({ calls, onRowClick, sort, onSortChange }: CallsTableProps) {
   if (calls.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-20 text-center">
@@ -65,12 +124,15 @@ export function CallsTable({ calls, onRowClick }: CallsTableProps) {
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-border">
-            <th className="text-left py-3 px-4 text-xs font-medium text-muted-foreground">Phone</th>
-            <th className="text-left py-3 px-4 text-xs font-medium text-muted-foreground">Caller</th>
-            <th className="text-left py-3 px-4 text-xs font-medium text-muted-foreground">Status</th>
-            <th className="text-left py-3 px-4 text-xs font-medium text-muted-foreground">Label</th>
-            <th className="text-left py-3 px-4 text-xs font-medium text-muted-foreground">Duration</th>
-            <th className="text-left py-3 px-4 text-xs font-medium text-muted-foreground">Started At</th>
+            {SORTABLE_COLUMNS.map((col) => (
+              <SortableHeader
+                key={col.field}
+                label={col.label}
+                field={col.field}
+                sort={sort}
+                onSort={onSortChange}
+              />
+            ))}
             <th className="py-3 px-4" />
           </tr>
         </thead>
