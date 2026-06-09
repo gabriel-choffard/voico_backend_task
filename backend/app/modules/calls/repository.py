@@ -1,7 +1,9 @@
 import math
 import uuid
+from datetime import datetime
 from typing import Optional
 
+from sqlalchemy import update
 from sqlmodel import func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -95,3 +97,21 @@ class CallRepository:
         await self.session.flush()
         await self.session.refresh(call)
         return call
+
+    async def expire_stale_calls(self, cutoff: datetime, now: datetime) -> int:
+        """Mark every ``in_progress`` call started before ``cutoff`` as ``failed``.
+
+        A single set-based ``UPDATE ... WHERE`` runs the whole batch in one round
+        trip — no per-row loads — and returns the number of rows it touched.
+        ``synchronize_session=False`` skips reconciling the (empty) identity map of
+        this short-lived background session, which is exactly what we want here.
+        """
+        stmt = (
+            update(Call)
+            .where(Call.status == CallStatus.in_progress)  # type: ignore[arg-type]
+            .where(Call.started_at < cutoff)  # type: ignore[arg-type]
+            .values(status=CallStatus.failed, updated_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        result = await self.session.execute(stmt)
+        return result.rowcount or 0  # type: ignore[attr-defined]

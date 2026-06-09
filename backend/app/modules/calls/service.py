@@ -1,6 +1,6 @@
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import HTTPException, status
@@ -70,3 +70,24 @@ class CallService:
         call.updated_at = datetime.utcnow()
         updated = await self.repository.update(call)
         return CallResponse.model_validate(updated, from_attributes=True)
+
+    async def expire_stale_calls(self, threshold_seconds: int) -> int:
+        """Mark calls stuck in ``in_progress`` past the threshold as ``failed``.
+
+        "Stale" is measured from each call's ``started_at``: anything that began
+        more than ``threshold_seconds`` ago is expired. The threshold is passed in
+        (read from config at the edge) so this stays a pure function of its input.
+        The count is logged every run — including ``0`` — so the job's activity is
+        always visible in the server logs.
+        """
+        now = datetime.utcnow()
+        cutoff = now - timedelta(seconds=threshold_seconds)
+
+        expired = await self.repository.expire_stale_calls(cutoff=cutoff, now=now)
+
+        logger.info(
+            "Stale-call expiry: marked %d call(s) as failed (in_progress for more than %d seconds)",
+            expired,
+            threshold_seconds,
+        )
+        return expired

@@ -64,6 +64,8 @@ Interactive docs: `http://localhost:8000/docs`
 |----------|-------------|
 | `DATABASE_URL` | SQLite database path (default: `sqlite+aiosqlite:///./db.sqlite3`) |
 | `OPENAI_API_KEY` | OpenAI API key — needed for Task 4 |
+| `STALE_CALL_CHECK_INTERVAL_SECONDS` | How often the stale-call expiry job runs, in seconds (default: `600` = 10 min) — Task 3 |
+| `STALE_CALL_THRESHOLD_SECONDS` | How long a call may stay `in_progress` before it's expired to `failed`, in seconds (default: `1800` = 30 min) — Task 3 |
 
 ---
 
@@ -182,6 +184,22 @@ On the **frontend**, add a filter UI that lets users add and remove filters. Eac
 **What to build:** A background job that runs automatically while the server is up. Every 10 minutes it checks for calls that have been `in_progress` for more than 30 minutes and marks them as `failed` in a single batch update. It should log how many calls were expired each run.
 
 The interval (10 min) and the stale threshold (30 min) must be configurable via environment variables — add them to `.env` and `app/core/config.py` so they are easy to adjust for testing without touching the code.
+
+#### ✅ Solution
+
+- **Config** ([`config.py`](backend/app/core/config.py), [`.env`](backend/.env), [`.env.example`](backend/.env.example)) — two new settings, `STALE_CALL_CHECK_INTERVAL_SECONDS` (default `600` = 10 min) and `STALE_CALL_THRESHOLD_SECONDS` (default `1800` = 30 min). Both are expressed **in seconds** on purpose: for testing you can dial them right down (e.g. interval `5`, threshold `10`) and watch a call expire end-to-end in seconds — no code change, no waiting half an hour. Defaults reproduce the spec's 10-/30-minute behaviour. Both are validated `ge=1`, so a nonsensical `0` (which would busy-loop the DB or expire brand-new calls) **fails fast at startup** instead of silently misbehaving.
+- **Background job wiring** ([`main.py`](backend/app/main.py)) — a FastAPI `lifespan` handler spawns the expiry loop as an `asyncio` task on startup and, on shutdown, **cancels it and awaits the cancellation**, so the job lives exactly as long as the server and stops cleanly (no orphaned task, no errors on Ctrl-C). This replaces the previous app with no lifecycle hooks.
+- **The loop** ([`tasks.py`](backend/app/modules/calls/tasks.py)) — `stale_call_expiry_loop()` runs **one pass immediately** on startup (so already-stale calls are cleaned up right away rather than after the first full interval), then repeats every `STALE_CALL_CHECK_INTERVAL_SECONDS`. A failed pass is logged (`logger.exception`) and **swallowed** so a transient DB hiccup never kills the loop — the next interval simply retries. It logs a line when it starts and when it's cancelled. Config is read **once here, at the edge**, and the threshold is passed down — the service stays config-agnostic.
+- **Per-run transaction** ([`tasks.py`](backend/app/modules/calls/tasks.py)) — each pass (`expire_stale_calls_once`) opens its **own session** and commits on success / rolls back on error, mirroring the `@session_manager` "commit at the edge" convention the routers use (the background job has no request/decorator to do this for it).
+- **Service** ([`service.py`](backend/app/modules/calls/service.py)) — `expire_stale_calls(threshold_seconds)` computes the cutoff as `utcnow() − threshold`, measured against each call's **`started_at`** (when the call actually began), delegates the write to the repository, and **logs the count every run — including `0`** — so the job's activity is always visible in the server logs, exactly as the task asks. The threshold is **injected** rather than read from global config, keeping the service a pure function of its inputs (consistent with the rest of the app, where only `db.py`/`main.py` touch `settings`). `started_at` and `utcnow()` are both naive UTC, so the comparison is apples-to-apples; the strict `<` correctly means "*more than* the threshold", so a call that started exactly at the threshold is left alone.
+- **Repository** ([`repository.py`](backend/app/modules/calls/repository.py)) — `expire_stale_calls()` is the **single batch update**: one set-based `UPDATE calls SET status='failed', updated_at=now WHERE status='in_progress' AND started_at < cutoff`. No per-row loads, one round trip; it returns `rowcount` (the number expired). `synchronize_session=False` skips reconciling the short-lived background session's (empty) identity map. This keeps the same `router → service → repository` layering as the rest of the app (here the loop stands in for the router).
+
+**Verification**
+
+- A scripted, multi-case run against a **copy** of the bundled `db.sqlite3` (the 18 `in_progress` calls in it all started weeks ago, so every one is stale): a huge threshold expires **0** (nothing is touched); the default 30-min threshold expires exactly **18** in one batch, growing `failed` 24 → 42 while `success` stays untouched; a freshly-inserted `in_progress` call (started "now") is correctly **spared**; a call started *exactly* at the cutoff is **not** expired (boundary of "more than"); every expired row has `status='failed'` and a freshly-bumped `updated_at`; and a second pass expires **0** (idempotent).
+- Ran the **real** `stale_call_expiry_loop()` via `asyncio.create_task`, let its immediate pass run, then cancelled and awaited it — the exact path the `lifespan` handler uses — confirming the loop expires the stale calls and shuts down cleanly. Also drove the app through a FastAPI **`TestClient`** context so the real ASGI **lifespan startup + shutdown** fire end-to-end without error. (In fact, while developing, the running `uvicorn --reload` server hot-reloaded and expired the live DB's 18 stale calls on its own — the feature working in situ.)
+- Confirmed the **fail-fast** config: `STALE_CALL_CHECK_INTERVAL_SECONDS=0` raises a `ValidationError` at startup rather than booting into a busy loop.
+- Backend `ruff check` / `ruff format` clean; `mypy` clean on all changed files.
 
 ---
 
