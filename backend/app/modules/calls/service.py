@@ -5,20 +5,24 @@ from typing import Optional
 
 from fastapi import HTTPException, status
 
+from app.modules.calls.enrichment import CallEnricher
 from app.modules.calls.repository import CallRepository
 from app.modules.calls.schema import (
     CallCounts,
     CallFilters,
     CallResponse,
+    CallStatus,
     PaginatedCallsResponse,
+    WebhookCallPayload,
 )
 
 logger = logging.getLogger(__name__)
 
 
 class CallService:
-    def __init__(self, repository: CallRepository) -> None:
+    def __init__(self, repository: CallRepository, enricher: Optional[CallEnricher] = None) -> None:
         self.repository = repository
+        self.enricher = enricher or CallEnricher()
 
     async def list_calls(
         self,
@@ -31,8 +35,6 @@ class CallService:
             and filters.max_duration is not None
             and filters.min_duration > filters.max_duration
         ):
-            # 422 (Unprocessable) — same status FastAPI uses for query validation.
-            # Literal int avoids the deprecated starlette `status.HTTP_422_*` alias.
             raise HTTPException(
                 status_code=422,
                 detail="min_duration cannot be greater than max_duration",
@@ -64,22 +66,36 @@ class CallService:
         call = await self.repository.get_by_id(call_id)
         if call is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found")
-        # Normalise blank/whitespace-only input to None so that `null` is the single
-        # canonical representation of "no notes", regardless of the client.
         call.notes = (notes or "").strip() or None
         call.updated_at = datetime.utcnow()
         updated = await self.repository.update(call)
         return CallResponse.model_validate(updated, from_attributes=True)
 
-    async def expire_stale_calls(self, threshold_seconds: int) -> int:
-        """Mark calls stuck in ``in_progress`` past the threshold as ``failed``.
+    async def process_webhook(self, payload: WebhookCallPayload) -> CallResponse:
 
-        "Stale" is measured from each call's ``started_at``: anything that began
-        more than ``threshold_seconds`` ago is expired. The threshold is passed in
-        (read from config at the edge) so this stays a pure function of its input.
-        The count is logged every run — including ``0`` — so the job's activity is
-        always visible in the server logs.
-        """
+        call = await self.repository.get_by_id(payload.call_id)
+        if call is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found")
+
+        call.status = payload.status
+        if payload.duration_seconds is not None:
+            call.duration_seconds = payload.duration_seconds
+        if payload.raw_transcript is not None:
+            call.raw_transcript = payload.raw_transcript
+        if payload.ended_at is not None:
+            call.ended_at = payload.ended_at
+        call.updated_at = datetime.utcnow()
+
+        if payload.status in (CallStatus.success, CallStatus.failed) and payload.raw_transcript:
+            enrichment = await self.enricher.enrich(payload.raw_transcript)
+            if enrichment is not None:
+                call.summary = enrichment.summary
+                call.label = enrichment.label
+
+        updated = await self.repository.update(call)
+        return CallResponse.model_validate(updated, from_attributes=True)
+
+    async def expire_stale_calls(self, threshold_seconds: int) -> int:
         now = datetime.utcnow()
         cutoff = now - timedelta(seconds=threshold_seconds)
 

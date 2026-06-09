@@ -55,7 +55,7 @@ Interactive docs: `http://localhost:8000/docs`
 | `GET` | `/api/calls` | List calls — multi-filter, search & column sorting, paginated — ✅ extended (Task 2) |
 | `GET` | `/api/calls/{id}` | Get single call |
 | `PATCH` | `/api/calls/{id}/notes` | Update notes on a call — ✅ implemented (Task 1) |
-| `POST` | `/api/webhook/call` | Update an existing call (status, duration, transcript, end time) — to be implemented in Task 4 |
+| `POST` | `/api/webhook/call` | Update an existing call (status, duration, transcript, end time) + AI summary/label — ✅ implemented (Task 4) |
 | `GET` | `/health` | Health check |
 
 ### Environment Variables
@@ -225,3 +225,32 @@ The interval (10 min) and the stale threshold (30 min) must be configurable via 
    }
    ```
 3. Hit **Execute** — the response will show the updated call with the generated summary and label.
+
+#### ✅ Solution
+
+The endpoint is implemented in the project's existing `router → service → repository` layering, with the OpenAI call isolated behind a small, best-effort enrichment client so the AI integration can never break the core "update the call" path.
+
+- **Router** ([`router.py`](backend/app/modules/calls/router.py)) — `POST /api/webhook/call` now resolves a `CallService` via the existing `get_call_service` dependency and delegates to `service.process_webhook(payload)`. It keeps the `session: SessionDep` parameter and the `@session_manager` decorator, so the whole webhook (call update **and** any enrichment) is committed in **one transaction** — or rolled back together on error — consistent with the rest of the app. Because FastAPI caches dependencies per-request, the `session` the decorator commits is the very same one the service writes through.
+- **Service** ([`service.py`](backend/app/modules/calls/service.py)) — new `process_webhook(payload)` with two clearly separated responsibilities:
+  1. **Update the call** — loads it by `call_id` (**404** `Call not found` if unknown), then applies the payload. `status` is required and always set; `duration_seconds`, `raw_transcript` and `ended_at` are written **only when the payload actually provides them**, so a webhook that omits a field never silently wipes a value already on the record. `updated_at` is bumped.
+  2. **AI enrichment** — runs **only** when the new status is `success` or `failed` **and** the payload carried a `raw_transcript`. It asks the enricher for a summary + label and, if one comes back, stores both. If enrichment returns `None` (any failure, or no API key), `summary`/`label` are simply left untouched (stay `null`) — exactly as the task requires.
+  - The service gained an injectable `enricher` (defaulting to a real `CallEnricher`); constructing it is cheap (no network until used), which keeps every other route unaffected while letting tests pass a fake.
+- **Enrichment client** ([`enrichment.py`](backend/app/modules/calls/enrichment.py), new) — a thin async wrapper over OpenAI's Chat Completions API, pinned to **`gpt-4o-mini`** as specified:
+  - Uses **Structured Outputs** (`response_format` `json_schema` with `strict: true`) whose schema fixes `summary` as a string and constrains `label` to an `enum` built **directly from `CallLabel`** — so the model can only ever return a valid label, and adding a new `CallLabel` automatically extends the allowed set. The schema is built once at import time and typed as the SDK's own `ResponseFormatJSONSchema`, so it's statically checked rather than an opaque dict. The system prompt asks for a concise **2–3 sentence** summary.
+  - It is **best-effort by construction**: `enrich()` **never raises**, always returning `None` on any problem. Failures are logged at two levels: **expected** API failures (bad/expired key, no quota, rate-limit, timeout, connection, 5xx — all `openai.APIError` subclasses) get a **concise one-line `WARNING`** (no traceback spam on every completed call), while genuinely **unexpected** errors (malformed JSON, an unknown label, a bug) keep a full `logger.exception` traceback. It also short-circuits to `None` (with a `WARNING`) when `OPENAI_API_KEY` is unset and on a blank transcript, so it never makes a doomed network call.
+  - **Bounded latency** — enrichment runs *inside* the webhook request, so the client is created with an explicit **20s timeout** and **a single retry** (instead of the SDK's 600s / 2-retry defaults). A flaky API can no longer keep the request — and its DB transaction — open for minutes; a persistent error (e.g. an account with no quota) falls back quickly. The `AsyncOpenAI` client is used as an async context manager so its HTTP connections are always closed, and a structured-output **refusal** or a **blank summary** is treated as "no enrichment" (logged, `None`) rather than stored.
+- **Config / env** — no new variables were needed: `OPENAI_API_KEY` already exists in [`config.py`](backend/app/core/config.py) and [`.env.example`](backend/.env.example). Set a real, **funded** key in `.env` to see live summaries/labels; leave it blank (or unfunded) and the webhook still updates the call (summary/label stay `null`).
+
+**Verification**
+
+- Drove the **real ASGI app** over HTTP (in-process `httpx` + `ASGITransport`) against a throwaway **copy** of the bundled `db.sqlite3` (which now has `0` `in_progress` calls — Task 3's job already expired them — so the test seeds its own fresh ones). With the OpenAI call **stubbed** (no key, no network, no cost), **24/24** checks passed across every path:
+  - **`success` + transcript** → status/`duration_seconds`/`ended_at`/`raw_transcript` all updated, `summary` + `label` set from the enricher, the enricher received the transcript, and the change **persists** on a follow-up `GET`.
+  - **`in_progress` + transcript** → enricher **not** called, `summary` stays `null` (enrichment is only for completed calls).
+  - **`failed` + transcript but enrichment returns `None`** → call still updates to `failed`, `summary`/`label` remain `null` (the required graceful fallback).
+  - **`success` with no transcript** → enricher **not** called, no crash.
+  - **Unknown `call_id`** → **404**.
+  - **Status-only update** → existing `duration_seconds` and `raw_transcript` are **preserved**, not wiped.
+  - **Real `CallEnricher`** → returns `None` (no network) when the API key is empty and on a blank transcript.
+- **Live OpenAI run (confirmed working end-to-end)** — exercised the **real** `gpt-4o-mini` call with a funded key. A free `models.list()` diagnostic confirmed the key is valid and `gpt-4o-mini` is accessible; then four representative transcripts each came back with a correct classification and a clean 2–3 sentence summary — *"upgrade my plan"* → **Sales inquiry**, *"…I want a refund"* → **Complaint**, *"book a dental check-up"* → **Appointment**, *"password reset email never arrived"* → **Support**. Finally a full webhook round-trip through the ASGI app (`POST /api/webhook/call`, real enricher, DB copy) returned **200** with `status=success`, a live-generated `summary`, and `label="Sales inquiry"`, and the values **persisted** on a follow-up `GET`. **12/12** live checks passed.
+  - During earlier testing two keys returned **`429 insufficient_quota`** (valid key, but the account had no prepaid balance); the client correctly caught it, logged a concise warning, and left `summary`/`label` `null` while still updating the call — so if live summaries ever stop appearing, check that `OPENAI_API_KEY` points at an account with **billing/credits** enabled (platform.openai.com → Billing).
+- Backend `ruff check` / `ruff format` clean and `mypy` clean on all changed files. The shipped `db.sqlite3` was left untouched (all testing ran on a copy, which was deleted afterwards).
